@@ -298,8 +298,8 @@ def category_fields(code, cat, product, dropdown):
     if material:
         cells[123 if cat not in {"19879", "20052", "20190", "32466", "39846"} else 283] = material
     country = origin_country(product)
-    if country and country in dropdown_values(dropdown, f"t_8_{cat}_Country/Region of Origin"):
-        cells[743] = country
+    # Merchant instruction: keep country of origin blank in the upload workbook,
+    # even if a product page states it. Keep the source fact in review.csv.
     if cat in {"11919", "11953", "11895"}:
         composition = props.get("Материал", "") or product["description"]
         cotton = re.search(r"(\d{1,3})%\s*памук", composition, re.I)
@@ -310,8 +310,14 @@ def category_fields(code, cat, product, dropdown):
             cells[189] = int(polyester.group(1))
         if cat == "11895" and "полиестер" in composition.lower() and not polyester:
             cells[189] = 100
-        # A duvet cover/sheet and a pillow protector have no separately stated lining.
-        # Do not guess the liner material; it remains in the review report.
+        if cat in {"11919", "11953"} and props.get("Вид на чаршафа", "").lower() in {"долен прав", "долен"}:
+            # A flat-sheet duvet set has no separate liner component. The N/A
+            # composition option is a percentage column in this Temu template.
+            cells[201] = 100
+            notes.append("Liner Material: N/A (100%); flat sheet and duvet cover, no separate liner listed.")
+        elif cat == "11895" and "полиестер" in composition.lower():
+            cells[210] = 100
+            notes.append("Pillow protector liner mapped to polyester from stated overall material; verify quilted backing.")
         if cat in {"11953", "11895"} and (cotton or polyester or 189 in cells):
             cells[250] = "Yes"
         if cat == "11953":
@@ -353,7 +359,16 @@ def category_fields(code, cat, product, dropdown):
         if any(c in cells for c in [691, 701, 706]):
             cells[690] = "cm-g-ml"
         if cat == "11919":
-            notes.append("Closure type not stated on Bagira; verify before upload.")
+            closure = choose(dropdown, f"t_3_{cat}_206 - Closure Type",
+                             ["Zipper"] if re.search(r"закопчаван\w*\s+с\s+цип|плик\w*\s+с\s+цип", desc) else
+                             ["Button"] if re.search(r"закопчаван\w*\s+с\s+копчет|плик\w*\s+с\s+копчет", desc) else
+                             ["Tie"] if re.search(r"закопчаван\w*\s+с\s+връзк", desc) else [])
+            if closure:
+                cells[134] = closure
+            else:
+                notes.append("Closure type not stated by Bagira; supplier confirmation needed.")
+            if props.get("Вид на чаршафа", "").lower() == "долен прав":
+                notes.append("Flat sheet 240 × 260 cm is entered; no fitted sheet is included, so fitted dimensions are inapplicable.")
     else:
         # One row per source article. For non-variant categories the Quantity
         # sale property uses one purchased SKU; coloured canisters use Color.
@@ -376,6 +391,7 @@ def category_fields(code, cat, product, dropdown):
                                 ["Stainless Steel"] if "неръждаема" in desc else ["Carbon Steel"] if "въглеродна" in desc else [])
             handles = (["Plastic"] if "дръжката: пластмаса" in desc else
                        ["Beechwood", "Wood"] if any(x in desc for x in ["букова", "бук"])
+                       else ["Wood"] if "дървените части на дръжката" in desc
                        else [])
             cells[363] = choose(dropdown, f"t_3_{cat}_403 - Handle Material", handles)
         if cat in {"15510", "54832", "13891", "39570", "15894", "9904"}:
@@ -400,10 +416,13 @@ def category_fields(code, cat, product, dropdown):
             cells[502] = choose(dropdown, f"t_3_{cat}_7039 - Are These Parts Original Car Parts?", ["No"])
         if cat == "20052":
             cells[565] = choose(dropdown, f"t_3_{cat}_6449 - Does It Contain Chemicals", ["Yes"])
+        if cat == "24964" and "глинения конус" in desc:
+            cells[123] = choose(dropdown, f"t_3_{cat}_121 - Material", ["Other material"])
+            notes.append("Material uses Other material because the Temu list has no Clay option; Bagira specifies a clay cone.")
     return {k: v for k, v in cells.items() if v is not None}, country, notes
 
 
-def missing_required(sheet, mode, cat, row, cells, country):
+def missing_required(sheet, mode, cat, row, cells, product):
     rr = next((r for r in range(1, mode.max_row + 1) if mode.cell(r, 1).value == cat + "_require"), None)
     if rr is None:
         return ["Category validation rules missing"]
@@ -415,8 +434,13 @@ def missing_required(sheet, mode, cat, row, cells, country):
         group = header.split(":", 1)[0] if header.startswith(("2021 - Cover Material:", "2035 - Liner Material:")) else header
         groups.setdefault(group, []).append(col)
     missing = []
+    not_applicable = []
     for name, columns in groups.items():
         if name == "List Price - EUR" and cells.get(723) == "N/A":
+            continue
+        if (name.startswith("89 - Fitted sheet - Product -") and cat == "11919"
+                and product["properties"].get("Вид на чаршафа", "").lower() == "долен прав"):
+            not_applicable.append(name)
             continue
         if not any(cells.get(c) not in (None, "") for c in columns):
             missing.append(name)
@@ -424,7 +448,7 @@ def missing_required(sheet, mode, cat, row, cells, country):
     # does not mark it. Its answer depends on the merchant's sales history.
     if not cells.get(798):
         missing.append("Post-13-Dec-2024 EU/NI market declaration")
-    return missing
+    return missing, not_applicable
 
 
 def main():
@@ -549,9 +573,13 @@ def main():
                 cells[723] = "N/A"
             extra, origin, notes = category_fields(code, category, item, dropdown)
             cells.update(extra)
-            missing = missing_required(sheet, mode, category, output_row, cells, origin)
-            entry["origin_country"] = origin or ""
+            for requested_blank in (743, 797, 798):
+                cells.pop(requested_blank, None)
+            missing, not_applicable = missing_required(sheet, mode, category, output_row, cells, item)
+            entry["origin_country"] = ""
+            entry["source_origin_country"] = origin or ""
             entry["missing_required"] = " | ".join(missing)
+            entry["template_required_not_applicable"] = " | ".join(not_applicable)
             entry["field_notes"] = " | ".join(notes)
             for i, picture in enumerate(item["images"][1:10], start=28):
                 cells[i] = picture
