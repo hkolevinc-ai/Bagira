@@ -1,0 +1,25 @@
+name: Bagira to Temu
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Collect Bagira products and fill Temu template
+        run: python scraper.py --export input/export.xlsx --template input/temu_template.xlsx --out results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bagira-temu-results
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
